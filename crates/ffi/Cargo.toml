@@ -1,0 +1,10 @@
+[package]
+name = "kvfabric-ffi"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Contained CUDA Runtime API loader for KV Fabric (dynamic load, no link-time dependency)."
+
+[lib]
+name = "kvfabric_ffi"
+path = "src/lib.rs"

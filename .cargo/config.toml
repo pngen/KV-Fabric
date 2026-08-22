@@ -1,0 +1,6 @@
+[build]
+# Treat all warnings as errors so the public release is warning-free by construction.
+rustflags = ["-D", "warnings"]
+
+[target.'cfg(windows)']
+# Nothing extra needed for the MSVC toolchain.

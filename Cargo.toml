@@ -1,0 +1,59 @@
+[package]
+name = "kvfabric"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.93"
+license = "Apache-2.0"
+authors = ["Summon Software Labs"]
+description = "A vendor-neutral distributed runtime for governing reusable KV inference state across accelerator memory, system memory, persistent storage, processes, and execution nodes."
+keywords = ["kv-cache", "inference", "prefix-cache", "distributed", "runtime", "llm"]
+repository = "https://github.com/summon-software-labs/kv-fabric"
+readme = "README.md"
+categories = ["caching", "network-programming", "memory-management"]
+
+[lib]
+name = "kvfabric"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvfabric"
+path = "src/main.rs"
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = ["dep:kvfabric-ffi"]
+
+[dependencies]
+kvfabric-ffi = { path = "crates/ffi", optional = true }
+
+[[bench]]
+name = "benchmarks"
+path = "benches/benchmarks.rs"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+overflow-checks = true
+debug = false
+panic = "unwind"
+
+[profile.dev]
+opt-level = 0
+overflow-checks = true
+debug = true
+
+[profile.bench]
+opt-level = 3
+overflow-checks = true
+debug = false
+
+[lints.rust]
+unused_imports = "deny"
+unused_variables = "warn"
+dead_code = "deny"
+
+[lints.clippy]
+# Keep clippy strict but allow pedantic-only noise in tests/examples.

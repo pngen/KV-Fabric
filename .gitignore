@@ -1,0 +1,32 @@
+# Rust / Cargo
+/target
+**/target
+Cargo.lock.orig
+**/*.rs.bk
+
+# Local runtime artifacts
+/run
+bench-scratch
+kvfabric-data
+kvfabric-data*/
+kvfabric-coordinator
+kvfabric-node*/
+cli2
+cli3
+cli-smoke
+exout.txt
+coord-out.txt
+coord-err.txt
+*.log
+*.tmp
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Diagnostic dumps
+core
+crash*.dmp
