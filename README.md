@@ -106,12 +106,7 @@ The CLI also manipulates a durable per-directory store, so a create in one invoc
 ## Testing
 
 `cargo test` runs the full suite: 94 unit tests, 10 integration tests, and a real multi-process coordinator+node TCP test. It covers property, concurrency, persistence, corruption, failure, and recovery behavior.
-## Limitations and roadmap
 
-+ The accelerator backend validates real CUDA allocation / host-device transfer / free on NVIDIA hardware. HIP, Level Zero, Metal and Vulkan backends are architecturally supported but not yet implemented.
-+ Durable objects recover their metadata and blocks; the token sequence used for prefix reuse is re-associated by the caller on first reuse (metadata deliberately does not store the token list). This is a documented boundary.
-+ The coordinator persists epoch and object ownership by atomic snapshot; a restarted coordinator advances its epoch and requires workers to re-register, so stale authority is rejected. (See RECOVERY.md.)
-+ Networking uses framed TCP on Windows and POSIX; QUIC is a future option.
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
