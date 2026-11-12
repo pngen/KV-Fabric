@@ -49,9 +49,21 @@ fn block_path(root: &Path, block: BlockId) -> PathBuf {
     root.join(BLOCK_DIR).join(format!("{}.blk", block))
 }
 
+/// Block ids recorded in an object's metadata file (none if it cannot be read).
+fn block_ids_of(root: &Path, id: ObjectId) -> Vec<BlockId> {
+    std::fs::read(meta_path(root, id))
+        .ok()
+        .and_then(|bytes| KvMetadata::decode(&bytes).ok())
+        .map(|meta| meta.block_ids)
+        .unwrap_or_default()
+}
+
 /// A durable object store with a manifest index and integrity recovery.
 pub struct DurableStore {
     root: PathBuf,
+    /// Serializes commits and removals. The manifest is rewritten as a whole,
+    /// so two unsynchronized writers would drop each other's entry.
+    commit_lock: std::sync::Mutex<()>,
 }
 
 impl DurableStore {
@@ -60,7 +72,7 @@ impl DurableStore {
         std::fs::create_dir_all(&root).map_err(|e| KvError::io(format!("create root: {}", e)))?;
         std::fs::create_dir_all(root.join(META_DIR)).map_err(|e| KvError::io(format!("create meta dir: {}", e)))?;
         std::fs::create_dir_all(root.join(BLOCK_DIR)).map_err(|e| KvError::io(format!("create block dir: {}", e)))?;
-        Ok(DurableStore { root })
+        Ok(DurableStore { root, commit_lock: std::sync::Mutex::new(()) })
     }
 
     pub fn root(&self) -> &Path {
@@ -87,6 +99,7 @@ impl DurableStore {
 
     /// Persist an object: blocks first, then metadata, then manifest.
     pub fn store_object(&self, meta: &KvMetadata, blocks: &[(&BlockId, &[u8])]) -> KvResult<()> {
+        let _commit = self.commit_lock.lock().map_err(|_| KvError::internal("durable store lock poisoned"))?;
         // Blocks first so a crash before the manifest cannot reference them.
         for (bid, payload) in blocks {
             atomic_write(&block_path(&self.root, **bid), payload)?;
@@ -129,15 +142,24 @@ impl DurableStore {
     }
 
     pub fn remove_object(&self, id: ObjectId) -> KvResult<()> {
+        let _commit = self.commit_lock.lock().map_err(|_| KvError::internal("durable store lock poisoned"))?;
+        // The metadata file is the only record of which block files belong to
+        // the object, so it is read before it is deleted.
+        let own = block_ids_of(&self.root, id);
         let _ = std::fs::remove_file(&meta_path(&self.root, id));
-        if let Ok(meta) = self.load_object(id) {
-            for (bid, _) in meta.1 {
-                let _ = std::fs::remove_file(&block_path(&self.root, bid));
-            }
-        }
         let mut manifest = self.read_manifest()?;
         manifest.retain(|o| o.object_id != id);
         atomic_write(&self.root.join(MANIFEST), &encode_manifest(&manifest))?;
+        // A block file that another object still lists is left in place.
+        let mut shared = std::collections::HashSet::new();
+        for entry in &manifest {
+            shared.extend(block_ids_of(&self.root, entry.object_id));
+        }
+        for bid in own {
+            if !shared.contains(&bid) {
+                let _ = std::fs::remove_file(&block_path(&self.root, bid));
+            }
+        }
         Ok(())
     }
 
@@ -304,6 +326,92 @@ mod tests {
         assert!(store.contains(meta.object_id));
         store.remove_object(meta.object_id).unwrap();
         assert!(!store.contains(meta.object_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_object_deletes_its_block_files() {
+        let dir = std::env::temp_dir().join(format!("kvfabric-dur5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = deterministic_rng(23);
+        let store = DurableStore::new(&dir).unwrap();
+        let (gone, gone_blocks) = make_meta(&mut rng, "ns", 3);
+        let (kept, kept_blocks) = make_meta(&mut rng, "ns", 2);
+        for (meta, blocks) in [(&gone, &gone_blocks), (&kept, &kept_blocks)] {
+            let refs: Vec<(&BlockId, &[u8])> = blocks.iter().map(|(b, p)| (b, p.as_slice())).collect();
+            store.store_object(meta, &refs).unwrap();
+        }
+        let with_both = store.used();
+        store.remove_object(gone.object_id).unwrap();
+        for (bid, _) in &gone_blocks {
+            assert!(!block_path(&dir, *bid).exists(), "block file of a removed object was left behind");
+        }
+        assert!(!meta_path(&dir, gone.object_id).exists());
+        assert!(store.used() + 3 * 512 <= with_both, "removal must give the block bytes back");
+        // The other object is untouched.
+        assert_eq!(store.load_object(kept.object_id).unwrap().1.len(), 2);
+        assert_eq!(store.recover().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_object_keeps_block_files_another_object_lists() {
+        let dir = std::env::temp_dir().join(format!("kvfabric-dur6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = deterministic_rng(24);
+        let store = DurableStore::new(&dir).unwrap();
+        // Two objects that list the same block ids (and so the same files).
+        let (first, blocks) = make_meta(&mut rng, "ns", 2);
+        let mut second = first.clone();
+        second.object_id = crate::id::random_object_id(&mut rng);
+        let refs: Vec<(&BlockId, &[u8])> = blocks.iter().map(|(b, p)| (b, p.as_slice())).collect();
+        store.store_object(&first, &refs).unwrap();
+        store.store_object(&second, &refs).unwrap();
+        store.remove_object(first.object_id).unwrap();
+        assert!(!store.contains(first.object_id));
+        assert_eq!(store.load_object(second.object_id).unwrap().1.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_commits_all_reach_the_manifest() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 5;
+        let dir = std::env::temp_dir().join(format!("kvfabric-dur7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = DurableStore::new(&dir).unwrap();
+        let start = std::sync::Barrier::new(THREADS);
+        // Every commit is attempted; failures are counted, not unwound, so the
+        // comparison below always runs.
+        let failed = std::sync::atomic::AtomicUsize::new(0);
+        let mut ids = Vec::new();
+        std::thread::scope(|s| {
+            let mut workers = Vec::new();
+            for t in 0..THREADS {
+                let (store, start, failed) = (&store, &start, &failed);
+                workers.push(s.spawn(move || {
+                    let mut rng = deterministic_rng(100 + t as u64);
+                    let mut mine = Vec::new();
+                    start.wait();
+                    for _ in 0..PER_THREAD {
+                        let (meta, blocks) = make_meta(&mut rng, "ns", 1);
+                        let refs: Vec<(&BlockId, &[u8])> = blocks.iter().map(|(b, p)| (b, p.as_slice())).collect();
+                        if store.store_object(&meta, &refs).is_err() {
+                            failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        mine.push(meta.object_id);
+                    }
+                    mine
+                }));
+            }
+            for w in workers {
+                ids.extend(w.join().unwrap());
+            }
+        });
+        assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 0, "a durable commit failed");
+        let missing = ids.iter().filter(|id| !store.contains(**id)).count();
+        assert_eq!(missing, 0, "committed objects are missing from the manifest");
+        assert_eq!(store.recover().unwrap().len(), THREADS * PER_THREAD);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

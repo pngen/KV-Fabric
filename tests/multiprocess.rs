@@ -44,6 +44,31 @@ fn status_ready(addr: &str, timeout: Duration) -> bool {
     false
 }
 
+/// Poll the coordinator until its status line contains `needle`, and return
+/// the last status line seen (which lacks `needle` only if the wait ran out).
+fn status_text(addr: &str, needle: &str, timeout: Duration) -> String {
+    let start = Instant::now();
+    let mut last = String::new();
+    while start.elapsed() < timeout {
+        if let Ok(mut s) = TcpStream::connect(addr) {
+            if write_frame(&mut s, 1, Op::Status, b"").is_ok() {
+                if let Ok(f) = read_frame(&mut s) {
+                    if f.op == Op::Reply {
+                        if let Ok(text) = kvfabric::bytes::Cursor::new(&f.payload).len_str(4096) {
+                            if text.contains(needle) {
+                                return text;
+                            }
+                            last = text;
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    last
+}
+
 #[test]
 fn multi_process_coordinator_node_status() {
     let bin = env!("CARGO_BIN_EXE_kvfabric");
@@ -54,18 +79,13 @@ fn multi_process_coordinator_node_status() {
     let mut guard = ChildGuard::new();
 
     guard.spawn(bin, &["coordinator", "--listen", "127.0.0.1:7801", "--data", coord_dir.to_str().unwrap()]);
-    assert!(status_ready("127.0.0.1:7801", Duration::from_secs(5)), "coordinator did not come up");
+    assert!(status_ready("127.0.0.1:7801", Duration::from_secs(60)), "coordinator did not come up");
 
     guard.spawn(bin, &["node", "--id", "7", "--coordinator", "127.0.0.1:7801", "--listen", "127.0.0.1:7802", "--data", node_dir.to_str().unwrap()]);
 
-    // Give the node a moment to register, then query the coordinator.
-    std::thread::sleep(Duration::from_millis(600));
-    let mut s = TcpStream::connect("127.0.0.1:7801").expect("connect to coordinator");
-    write_frame(&mut s, 1, Op::Status, b"").unwrap();
-    let frame = read_frame(&mut s).expect("read status reply");
-    assert_eq!(frame.op, Op::Reply);
-    let mut c = kvfabric::bytes::Cursor::new(&frame.payload);
-    let text = c.len_str(4096).unwrap();
+    // The node registers some time after it is spawned: wait for the
+    // coordinator to report it instead of assuming how long that takes.
+    let text = status_text("127.0.0.1:7801", "nodes=1", Duration::from_secs(60));
     assert!(text.contains("epoch="), "status must report the authority epoch: {}", text);
     assert!(text.contains("nodes=1"), "status must report the registered node: {}", text);
     assert!(text.contains("objects=0"), "status must report object count: {}", text);

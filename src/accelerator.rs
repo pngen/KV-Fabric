@@ -84,7 +84,10 @@ mod cuda_backend {
     pub struct CudaDeviceStore {
         cuda: Cuda,
         capacity: u64,
-        used: Arc<std::sync::atomic::AtomicU64>,
+        /// Bytes held per key. One lock covers the capacity check and the
+        /// update, so a replaced entry is charged once and concurrent stores
+        /// cannot overshoot the capacity together.
+        sizes: std::sync::Mutex<std::collections::HashMap<Vec<u8>, u64>>,
     }
 
     impl CudaDeviceStore {
@@ -94,7 +97,7 @@ mod cuda_backend {
             if dev < 1 {
                 return Err(KvError::unsupported("no CUDA device present"));
             }
-            Ok(CudaDeviceStore { cuda, capacity, used: Arc::new(std::sync::atomic::AtomicU64::new(0)) })
+            Ok(CudaDeviceStore { cuda, capacity, sizes: std::sync::Mutex::new(std::collections::HashMap::new()) })
         }
     }
 
@@ -109,16 +112,18 @@ mod cuda_backend {
             self.capacity
         }
         fn used(&self) -> u64 {
-            self.used.load(std::sync::atomic::Ordering::Relaxed)
+            self.sizes.lock().map(|m| m.values().sum()).unwrap_or(0)
         }
         fn store(&self, key: &[u8], payload: &[u8]) -> KvResult<()> {
             let n = payload.len() as u64;
-            let new_used = self.used.load(std::sync::atomic::Ordering::Relaxed) + n;
-            if new_used > self.capacity {
+            let mut sizes = self.sizes.lock().map_err(|_| KvError::internal("CUDA accounting lock poisoned"))?;
+            let held: u64 = sizes.values().sum();
+            let replaced = sizes.get(key).copied().unwrap_or(0);
+            if (held - replaced).saturating_add(n) > self.capacity {
                 return Err(KvError::capacity("CUDA device capacity exceeded"));
             }
             self.cuda.store(key, payload).map_err(|e| KvError::internal(format!("CUDA store: {}", e)))?;
-            self.used.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            sizes.insert(key.to_vec(), n);
             Ok(())
         }
         fn load(&self, key: &[u8]) -> KvResult<Vec<u8>> {
@@ -126,8 +131,9 @@ mod cuda_backend {
             Ok(payload)
         }
         fn remove(&self, key: &[u8]) -> KvResult<()> {
-            let n = self.cuda.remove(key).map_err(|e| KvError::internal(format!("CUDA remove: {}", e)))?;
-            self.used.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+            let mut sizes = self.sizes.lock().map_err(|_| KvError::internal("CUDA accounting lock poisoned"))?;
+            self.cuda.remove(key).map_err(|e| KvError::internal(format!("CUDA remove: {}", e)))?;
+            sizes.remove(key);
             Ok(())
         }
         fn exists(&self, key: &[u8]) -> bool {
@@ -183,5 +189,23 @@ mod tests {
         assert!(!s.is_hardware());
         s.store(b"a", b"1").unwrap();
         assert_eq!(s.load(b"a").unwrap(), b"1");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_store_charges_a_replaced_entry_once() {
+        // Runs against the device when one is present, like the loader test.
+        if let Ok(s) = CudaDeviceStore::new(1024) {
+            s.store(b"k", &[1u8; 100]).unwrap();
+            s.store(b"k", &[2u8; 100]).unwrap();
+            assert_eq!(s.used(), 100, "an overwritten entry is charged once");
+            assert_eq!(s.load(b"k").unwrap(), vec![2u8; 100]);
+            // Replacing an entry needs room only for the difference.
+            s.store(b"k", &[3u8; 1000]).unwrap();
+            assert_eq!(s.used(), 1000);
+            assert_eq!(s.store(b"j", &[0u8; 100]).unwrap_err().kind(), crate::error::ErrorKind::Capacity);
+            s.remove(b"k").unwrap();
+            assert_eq!(s.used(), 0);
+        }
     }
 }

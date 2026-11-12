@@ -201,7 +201,7 @@ pub fn plan(input: &PlanInput) -> Plan {
         decision,
         estimated_cost: cost,
         recompute_cost: input.recompute_cost,
-        transfer_cost: input.promotion_cost + input.demotion_cost + input.restore_cost,
+        transfer_cost: input.promotion_cost.saturating_add(input.demotion_cost).saturating_add(input.restore_cost),
         retention_cost: input.persistence_cost,
         reuse_value: input.reuse_value,
         reasoning: reason,
@@ -277,5 +277,16 @@ mod tests {
     #[test]
     fn deterministic_for_same_input() {
         assert_eq!(plan(&resident()), plan(&resident()));
+    }
+
+    #[test]
+    fn unbounded_cost_terms_saturate() {
+        // u64::MAX marks an unavailable path (as the default recompute cost
+        // does); summing it into the report must not overflow.
+        let mut i = resident();
+        i.restore_cost = u64::MAX;
+        let p = plan(&i);
+        assert_eq!(p.decision, Decision::ReuseInPlace);
+        assert_eq!(p.transfer_cost, u64::MAX);
     }
 }

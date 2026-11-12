@@ -57,7 +57,20 @@ pub struct Coordinator {
     prefixes: PrefixStore,
     leases: LeaseRegistry,
     snapshot_dir: Option<PathBuf>,
+    /// Serializes snapshot writes, so each one records a state at least as new
+    /// as the one written before it.
+    snapshot_lock: Mutex<()>,
     rng: Mutex<crate::rng::Xoshiro256>,
+}
+
+/// Require `boot` to be the boot currently registered for `node`. A boot id
+/// that a later registration of the same node replaced holds no authority.
+fn require_current_boot(nodes: &HashMap<NodeId, NodeRecord>, node: NodeId, boot: u128) -> KvResult<()> {
+    match nodes.get(&node) {
+        Some(rec) if rec.boot_id == boot => Ok(()),
+        Some(_) => Err(KvError::stale_authority("node boot identity is stale")),
+        None => Err(KvError::unauthorized("node is not registered")),
+    }
 }
 
 impl Coordinator {
@@ -75,6 +88,7 @@ impl Coordinator {
             prefixes: PrefixStore::new(),
             leases: LeaseRegistry::new(),
             snapshot_dir,
+            snapshot_lock: Mutex::new(()),
             rng: Mutex::new(rng),
         };
         // Recover durable state (epoch, objects).
@@ -137,11 +151,14 @@ impl Coordinator {
 
     /// Owner of an object, if known and authoritative in the current epoch.
     pub fn owner_of(&self, object_id: ObjectId) -> Option<(NodeId, u128, u64)> {
+        let nodes = self.nodes.read().ok()?;
         let objects = self.objects.read().ok()?;
         let o = objects.get(&object_id)?;
         if o.authority_epoch != self.epoch() {
             return None;
         }
+        // An owner whose boot has since been replaced is not authoritative.
+        require_current_boot(&nodes, o.owner, o.owner_boot).ok()?;
         Some((o.owner, o.owner_boot, o.authority_epoch))
     }
 
@@ -153,6 +170,10 @@ impl Coordinator {
             return Err(KvError::rejected("only committed objects may be registered"));
         }
         {
+            // Ownership is only recorded for the boot the node is registered
+            // with now (the registry is always locked before the objects).
+            let nodes = self.nodes.read().map_err(|_| KvError::internal("nodes lock poisoned"))?;
+            require_current_boot(&nodes, owner, owner_boot)?;
             let mut objects = self.objects.write().map_err(|_| KvError::internal("objects lock poisoned"))?;
             if let Some(existing) = objects.get(&meta.object_id) {
                 if existing.meta.generation >= meta.generation {
@@ -186,11 +207,15 @@ impl Coordinator {
     pub fn acquire_lease(&self, object_id: ObjectId, holder: NodeId, boot: u128, kind: LeaseKind, ttl: u64) -> KvResult<()> {
         let epoch = self.epoch();
         // Authority: object must exist and be owned by this holder in this epoch.
+        let nodes = self.nodes.read().map_err(|_| KvError::internal("nodes lock poisoned"))?;
         let objects = self.objects.read().map_err(|_| KvError::internal("objects lock poisoned"))?;
         let st = objects.get(&object_id).ok_or_else(|| KvError::not_found("object unknown"))?;
         if st.owner != holder || st.owner_boot != boot || st.authority_epoch != epoch {
             return Err(KvError::unauthorized("holder has no authority over this object"));
         }
+        // ...and the holder's boot must still be the registered one: a node
+        // that re-registered left its previous boot without authority.
+        require_current_boot(&nodes, holder, boot)?;
         let _ = self.leases.acquire(object_id, holder, boot, kind, epoch, ttl, self.clock.as_ref())?;
         Ok(())
     }
@@ -224,6 +249,7 @@ impl Coordinator {
     pub fn migrate_commit(&self, object_id: ObjectId, new_owner: NodeId, new_owner_boot: u128, new_gen: Generation, caller: NodeId, caller_boot: u128) -> KvResult<()> {
         let epoch = self.epoch();
         {
+            let nodes = self.nodes.read().map_err(|_| KvError::internal("nodes lock poisoned"))?;
             let mut objects = self.objects.write().map_err(|_| KvError::internal("objects lock poisoned"))?;
             let st = objects.get_mut(&object_id).ok_or_else(|| KvError::not_found("object unknown"))?;
             if st.authority_epoch != epoch {
@@ -232,6 +258,10 @@ impl Coordinator {
             if st.owner != caller || st.owner_boot != caller_boot {
                 return Err(KvError::unauthorized("not the current owner"));
             }
+            // Neither side of an ownership change may be a boot that a later
+            // registration of the same node has replaced.
+            require_current_boot(&nodes, caller, caller_boot)?;
+            require_current_boot(&nodes, new_owner, new_owner_boot)?;
             if new_gen.get() <= st.meta.generation.get() {
                 return Err(KvError::stale_generation("target generation not newer"));
             }
@@ -246,6 +276,7 @@ impl Coordinator {
 
     fn maybe_snapshot(&self) -> KvResult<()> {
         let Some(dir) = &self.snapshot_dir else { return Ok(()); };
+        let _writer = self.snapshot_lock.lock().map_err(|_| KvError::internal("snapshot lock poisoned"))?;
         let epoch = self.epoch();
         let objects = self.objects.read().map(|m| m.values().cloned().collect::<Vec<_>>()).unwrap_or_default();
         crate::persistence::atomic_write(&dir.join("coordinator.snapshot"), &encode_snapshot(epoch, &objects))
@@ -347,6 +378,110 @@ mod tests {
         let c2 = Coordinator::new(cfg, Arc::new(MockClock::new()), Some(dir.clone())).unwrap();
         assert!(c2.epoch() > e1, "epoch must advance after restart");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn committed(id: u128) -> KvMetadata {
+        let mut m = KvMetadata::new(ObjectId::from_u128(id), Generation::one(), "ns");
+        m.lifecycle = crate::lifecycle::LifecycleState::Committed;
+        m
+    }
+
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{}", port).parse().unwrap()
+    }
+
+    #[test]
+    fn a_replaced_boot_holds_no_authority() {
+        use crate::error::ErrorKind;
+        let c = coord();
+        c.register(NodeId(1), 0xaa, addr(7000), vec![]).unwrap();
+        c.register(NodeId(2), 0xcc, addr(7001), vec![]).unwrap();
+        let obj = committed(1);
+        let id = obj.object_id;
+        c.register_object(&obj, NodeId(1), 0xaa).unwrap();
+        c.acquire_lease(id, NodeId(1), 0xaa, LeaseKind::Read, 60).unwrap();
+        assert_eq!(c.lease_count(id), 1);
+
+        // Node 1 restarts and registers a new boot: 0xaa is now stale.
+        c.register(NodeId(1), 0xbb, addr(7000), vec![]).unwrap();
+        assert_eq!(c.acquire_lease(id, NodeId(1), 0xaa, LeaseKind::Write, 60).unwrap_err().kind(), ErrorKind::StaleAuthority);
+        assert_eq!(c.lease_count(id), 1, "no lease may be granted to the replaced boot");
+        assert_eq!(
+            c.migrate_commit(id, NodeId(2), 0xcc, Generation::new(2), NodeId(1), 0xaa).unwrap_err().kind(),
+            ErrorKind::StaleAuthority
+        );
+        assert_eq!(c.object_metadata(id).unwrap().generation, Generation::one(), "ownership must not have moved");
+        assert!(c.owner_of(id).is_none(), "a replaced boot is not an authoritative owner");
+
+        // The replaced boot cannot claim new objects either; nor can a node
+        // that never registered. The current boot can.
+        let other = committed(2);
+        assert_eq!(c.register_object(&other, NodeId(1), 0xaa).unwrap_err().kind(), ErrorKind::StaleAuthority);
+        assert_eq!(c.register_object(&other, NodeId(9), 0x1).unwrap_err().kind(), ErrorKind::Unauthorized);
+        assert_eq!(c.object_count(), 1);
+        c.register_object(&other, NodeId(1), 0xbb).unwrap();
+        c.acquire_lease(other.object_id, NodeId(1), 0xbb, LeaseKind::Write, 60).unwrap();
+        assert_eq!(c.owner_of(other.object_id).map(|(n, b, _)| (n, b)), Some((NodeId(1), 0xbb)));
+    }
+
+    #[test]
+    fn ownership_is_not_transferred_to_a_replaced_boot() {
+        use crate::error::ErrorKind;
+        let c = coord();
+        c.register(NodeId(1), 0xaa, addr(7000), vec![]).unwrap();
+        c.register(NodeId(2), 0xcc, addr(7001), vec![]).unwrap();
+        let obj = committed(3);
+        let id = obj.object_id;
+        c.register_object(&obj, NodeId(1), 0xaa).unwrap();
+        // The destination restarted after the migration was planned.
+        c.register(NodeId(2), 0xdd, addr(7001), vec![]).unwrap();
+        assert_eq!(
+            c.migrate_commit(id, NodeId(2), 0xcc, Generation::new(2), NodeId(1), 0xaa).unwrap_err().kind(),
+            ErrorKind::StaleAuthority
+        );
+        assert_eq!(c.owner_of(id).map(|(n, b, _)| (n, b)), Some((NodeId(1), 0xaa)));
+        // Committing to the destination's current boot succeeds.
+        c.migrate_commit(id, NodeId(2), 0xdd, Generation::new(2), NodeId(1), 0xaa).unwrap();
+        assert_eq!(c.owner_of(id).map(|(n, b, _)| (n, b)), Some((NodeId(2), 0xdd)));
+    }
+
+    #[test]
+    fn concurrent_registrations_all_reach_the_snapshot() {
+        const THREADS: u128 = 8;
+        const PER_THREAD: u128 = 4;
+        let expected = (THREADS * PER_THREAD) as usize;
+        let mut worst = expected;
+        // A stale or torn snapshot only shows when writers overlap, so the
+        // scenario is repeated; every round has to be complete.
+        for round in 0..8u128 {
+            let dir = std::env::temp_dir().join(format!("kvfabric-coord-snap-{}-{}", std::process::id(), round));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cfg = Arc::new(Config::default());
+            {
+                let c = Coordinator::new(cfg.clone(), Arc::new(MockClock::new()), Some(dir.clone())).unwrap();
+                c.register(NodeId(1), 0xaa, addr(7000), vec![]).unwrap();
+                let start = std::sync::Barrier::new(THREADS as usize);
+                std::thread::scope(|s| {
+                    for t in 0..THREADS {
+                        let (c, start) = (&c, &start);
+                        s.spawn(move || {
+                            start.wait();
+                            for i in 0..PER_THREAD {
+                                let _ = c.register_object(&committed(1 + round * 10_000 + t * 100 + i), NodeId(1), 0xaa);
+                            }
+                        });
+                    }
+                });
+                worst = worst.min(c.object_count());
+            }
+            // A restarted coordinator sees exactly what was acknowledged.
+            let recovered = Coordinator::new(cfg, Arc::new(MockClock::new()), Some(dir.clone()))
+                .map(|c| c.object_count())
+                .unwrap_or(0);
+            worst = worst.min(recovered);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert_eq!(worst, expected, "a registered object is missing from the durable snapshot");
     }
 }
 

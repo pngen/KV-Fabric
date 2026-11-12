@@ -90,10 +90,11 @@ pub fn decide(input: &AdmissionInput) -> AdmitDecision {
     // Namespace quota checks.
     let bytes_fit = input.byte_size <= input.namespace_max_bytes.saturating_sub(input.namespace_used_bytes);
     let objects_fit = input.namespace_used_objects < input.namespace_max_objects;
-    if !bytes_fit || !objects_fit {
-        if !bytes_fit {
-            return AdmitDecision { mode: AdmitMode::Replace, reason: "namespace byte quota exceeded; replace candidate".into() };
-        }
+    if !bytes_fit {
+        return AdmitDecision { mode: AdmitMode::Replace, reason: "namespace byte quota exceeded; replace candidate".into() };
+    }
+    if !objects_fit {
+        return AdmitDecision { mode: AdmitMode::Replace, reason: "namespace object quota exceeded; replace candidate".into() };
     }
 
     // Overall capacity check.
@@ -179,6 +180,19 @@ mod tests {
         i.namespace_used_bytes = 90;
         let d = decide(&i);
         assert_eq!(d.mode, AdmitMode::Replace);
+    }
+
+    #[test]
+    fn object_quota_exceeded_is_replace() {
+        let mut i = base();
+        i.reuse_value = 50000; // would be admitted hot if the quota were ignored
+        i.namespace_max_objects = 5;
+        i.namespace_used_objects = 5;
+        let d = decide(&i);
+        assert_eq!(d.mode, AdmitMode::Replace);
+        // One object below the quota is still admitted.
+        i.namespace_used_objects = 4;
+        assert_eq!(decide(&i).mode, AdmitMode::Hot);
     }
 
     #[test]
